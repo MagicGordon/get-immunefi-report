@@ -115,6 +115,8 @@ interface ReportItem {
   sla: string;
   lastUpdate: string;
   link: string;
+  unread: boolean;
+  stale: boolean;
 }
 
 async function getReports(context: BrowserContext, filter: string): Promise<ReportItem[]> {
@@ -161,8 +163,10 @@ async function getReports(context: BrowserContext, filter: string): Promise<Repo
       const link = await row.locator("a").first().getAttribute("href").catch(() => "");
 
       // Parse Report Details cell (td[3]): "#ID\nTitle\nSeverity\nType"
+      // May also contain "Unread" / "Stale" badge text
       const detailLines = (c[3] || "").split("\n").map((s) => s.trim()).filter(Boolean);
-      // Filter out "Unread" / "Stale" badge text
+      const unread = detailLines.includes("Unread");
+      const stale = detailLines.includes("Stale");
       const cleanLines = detailLines.filter((l) => l !== "Unread" && l !== "Stale");
       const id = cleanLines[0] || "";
       const title = cleanLines[1] || "";
@@ -181,6 +185,8 @@ async function getReports(context: BrowserContext, filter: string): Promise<Repo
         sla: (c[6] || "").trim(),
         lastUpdate: (c[7] || "").trim(),
         link: link ? (link.startsWith("http") ? link : `${BASE_URL}${link}`) : "",
+        unread,
+        stale,
       });
     }
 
@@ -443,7 +449,8 @@ async function main() {
       console.log(`${"=".repeat(60)}\n`);
 
       reports.forEach((r, i) => {
-        console.log(`[${i + 1}] ${r.id} ${r.title}`);
+        const badges = [r.unread ? "Unread" : "Read", r.stale ? "Stale" : ""].filter(Boolean).join(", ");
+        console.log(`[${i + 1}] ${r.id} ${r.title} [${badges}]`);
         console.log(`    Severity: ${r.severity} | Type: ${r.type} | Status: ${r.status}`);
         console.log(`    Whitehat: ${r.whitehat} | SLA: ${r.sla}`);
         console.log(`    Date: ${r.date}`);
