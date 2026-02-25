@@ -1,4 +1,5 @@
-REPORT_FILTER=Closed REPORT_ID=25427 npm start
+REPORT_FILTER=Escalated npm start
+REPORT_ID=67128 npm start
 
 npm run server
 curl http://localhost:3210/reports?status=Escalated | python3 -m json.tool 
