@@ -1,1 +1,6 @@
-REPORT_FILTER=Closed REPORT_ID=25427 npx ts-node src/index.ts
+REPORT_FILTER=Closed REPORT_ID=25427 npm start
+
+npm run server
+curl http://localhost:3210/reports?status=Escalated | python3 -m json.tool 
+curl http://localhost:3210/reports/65679 | python3 -m json.tool
+curl http://localhost:3210/reports/67128 | python3 -m json.tool
