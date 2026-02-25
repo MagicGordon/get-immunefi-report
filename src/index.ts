@@ -7,16 +7,19 @@ dotenv.config();
 
 const USER_DATA_DIR = path.join(__dirname, "..", ".auth", "user-data");
 const SCREENSHOT_DIR = path.join(__dirname, "..", ".auth");
-const IMMUNEFI_BUGS_URL = "https://bugs.immunefi.com";
+const BASE_URL = "https://bugs.immunefi.com";
 const REPORT_FILTER = process.env.REPORT_FILTER || "Escalated";
 const REPORT_ID = process.env.REPORT_ID || "";
+
+// Magnus platform paths (Ref Finance specific — adjust IDs for other orgs/projects)
+const REPORTS_BASE = "/magnus/935/projects/642/bug-bounty/reports";
+const PROGRAM_ID = "435";
 
 function getCredentials(): { email: string; password: string } {
   const email = process.env.IMMUNEFI_EMAIL;
   const password = process.env.IMMUNEFI_PASSWORD;
   if (!email || !password) {
     console.error("Missing IMMUNEFI_EMAIL or IMMUNEFI_PASSWORD in .env file.");
-    console.error("Copy .env.example to .env and fill in your credentials.");
     process.exit(1);
   }
   return { email, password };
@@ -24,23 +27,18 @@ function getCredentials(): { email: string; password: string } {
 
 function ensureDirs() {
   for (const dir of [USER_DATA_DIR, SCREENSHOT_DIR]) {
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   }
 }
 
 async function checkLoginStatus(context: BrowserContext): Promise<boolean> {
   const page = await context.newPage();
   try {
-    await page.goto(IMMUNEFI_BUGS_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.goto(BASE_URL, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(2000);
-
-    const url = page.url();
-    console.log(`Current URL: ${url}`);
+    console.log(`Current URL: ${page.url()}`);
 
     const isOnLoginPage = await page.locator('input[name="email"]').isVisible({ timeout: 3000 }).catch(() => false);
-
     if (!isOnLoginPage) {
       console.log("Session is valid, already logged in.");
       await page.close();
@@ -63,7 +61,7 @@ async function performLogin(context: BrowserContext): Promise<boolean> {
 
   try {
     console.log("Navigating to login page...");
-    await page.goto(IMMUNEFI_BUGS_URL, { waitUntil: "networkidle", timeout: 30000 });
+    await page.goto(BASE_URL, { waitUntil: "networkidle", timeout: 30000 });
     await page.waitForTimeout(1000);
 
     console.log("Filling in credentials...");
@@ -77,23 +75,19 @@ async function performLogin(context: BrowserContext): Promise<boolean> {
     try {
       await page.waitForURL((url) => {
         const href = url.toString();
-        return !href.endsWith("/") || href.includes("dashboard") || href.includes("report");
+        return href.includes("magnus") || href.includes("dashboard");
       }, { timeout: 30000 });
     } catch {
-      console.log("URL did not change, checking page state...");
+      console.log("URL did not change as expected, checking state...");
     }
 
     await page.waitForTimeout(3000);
-    const url = page.url();
-    console.log(`URL after login: ${url}`);
+    console.log(`URL after login: ${page.url()}`);
 
     const stillOnLogin = await page.locator('input[name="email"]').isVisible({ timeout: 3000 }).catch(() => false);
-
     if (stillOnLogin) {
       await page.screenshot({ path: path.join(SCREENSHOT_DIR, "login-failed.png"), fullPage: true });
       console.error("Login failed! Screenshot saved to .auth/login-failed.png");
-      const errorText = await page.locator('[class*="error"], [class*="alert"], [role="alert"]').first().innerText().catch(() => "");
-      if (errorText) console.error(`Error message: ${errorText}`);
       await page.close();
       return false;
     }
@@ -113,11 +107,13 @@ interface ReportItem {
   id: string;
   title: string;
   date: string;
-  reporter: string;
-  level: string;
+  status: string;
   severity: string;
   type: string;
-  status: string;
+  assignee: string;
+  whitehat: string;
+  sla: string;
+  lastUpdate: string;
   link: string;
 }
 
@@ -125,46 +121,70 @@ async function getReports(context: BrowserContext, filter: string): Promise<Repo
   const page = await context.newPage();
 
   try {
-    // Navigate to Program Reports with status filter via URL query param
-    // Filter values: all (no param), escalated, confirmed, paid, closed
-    const statusParam = filter.toLowerCase() === "all" ? "" : `?status=${filter.toLowerCase()}`;
-    const reportsUrl = `${IMMUNEFI_BUGS_URL}/program-reports${statusParam}`;
+    // New Magnus UI: /magnus/.../bug-bounty/reports?programId=435&status=escalated
+    const statusParam = filter.toLowerCase() === "all" ? "" : `&status=${filter.toLowerCase()}`;
+    const reportsUrl = `${BASE_URL}${REPORTS_BASE}?programId=${PROGRAM_ID}${statusParam}`;
     console.log(`\nNavigating to: ${reportsUrl}`);
-    await page.goto(reportsUrl, { waitUntil: "networkidle", timeout: 30000 });
-    await page.waitForTimeout(2000);
-    console.log(`Page URL: ${page.url()}`);
+    await page.goto(reportsUrl, { waitUntil: "networkidle", timeout: 60000 });
 
+    // Wait for table data to load (Loading... disappears)
+    console.log("Waiting for table data...");
+    try {
+      await page.waitForFunction(() => {
+        const cells = document.querySelectorAll("table tbody tr td");
+        for (const c of cells) {
+          if (c.textContent?.includes("Loading")) return false;
+        }
+        return cells.length > 1;
+      }, { timeout: 30000 });
+    } catch {
+      console.log("Table load timeout — proceeding with available data");
+    }
+    await page.waitForTimeout(2000);
+
+    console.log(`Page URL: ${page.url()}`);
     await page.screenshot({ path: path.join(SCREENSHOT_DIR, "filtered-reports.png"), fullPage: true });
 
-    // Scrape table rows
+    // New table columns:
+    // td[0]=checkbox, [1]=Submitted At, [2]=Status, [3]=Report Details (ID+Title+Severity+Type),
+    // [4]=Assignee, [5]=Whitehat, [6]=SLA, [7]=Last Update
     const rows = page.locator("table tbody tr");
     const rowCount = await rows.count();
     console.log(`Found ${rowCount} report rows`);
 
     const reports: ReportItem[] = [];
 
-    if (rowCount > 0) {
-      // td[0]=checkbox, [1]=ID, [2]=Title, [3]=Date, [4]=Reporter,
-      // [5]=Level, [6]=Severity, [7]=Type, [8]=ClosedBy, [9]=Status
-      for (let i = 0; i < rowCount; i++) {
-        const row = rows.nth(i);
-        const cells = await row.locator("td").all();
-        const c = await Promise.all(cells.map((cell) => cell.innerText().catch(() => "")));
-        const link = await row.locator("a").first().getAttribute("href").catch(() => "");
+    for (let i = 0; i < rowCount; i++) {
+      const row = rows.nth(i);
+      const cells = await row.locator("td").all();
+      const c = await Promise.all(cells.map((cell) => cell.innerText().catch(() => "")));
+      const link = await row.locator("a").first().getAttribute("href").catch(() => "");
 
-        reports.push({
-          id: (c[1] || "").trim(),
-          title: (c[2] || "").trim(),
-          date: (c[3] || "").trim(),
-          reporter: (c[4] || "").trim(),
-          level: (c[5] || "").trim(),
-          severity: (c[6] || "").trim(),
-          type: (c[7] || "").trim(),
-          status: (c[9] || "").trim(),
-          link: link ? (link.startsWith("http") ? link : `${IMMUNEFI_BUGS_URL}${link}`) : "",
-        });
-      }
-    } else {
+      // Parse Report Details cell (td[3]): "#ID\nTitle\nSeverity\nType"
+      const detailLines = (c[3] || "").split("\n").map((s) => s.trim()).filter(Boolean);
+      // Filter out "Unread" / "Stale" badge text
+      const cleanLines = detailLines.filter((l) => l !== "Unread" && l !== "Stale");
+      const id = cleanLines[0] || "";
+      const title = cleanLines[1] || "";
+      const severity = cleanLines[2] || "";
+      const type = cleanLines[3] || "";
+
+      reports.push({
+        id,
+        title,
+        date: (c[1] || "").trim(),
+        status: (c[2] || "").trim(),
+        severity,
+        type,
+        assignee: (c[4] || "").trim(),
+        whitehat: (c[5] || "").trim(),
+        sla: (c[6] || "").trim(),
+        lastUpdate: (c[7] || "").trim(),
+        link: link ? (link.startsWith("http") ? link : `${BASE_URL}${link}`) : "",
+      });
+    }
+
+    if (reports.length === 0) {
       console.log("\nNo report rows found. Page content:");
       const bodyText = await page.locator("body").innerText();
       console.log(bodyText.substring(0, 2000));
@@ -185,7 +205,11 @@ async function getReportDetail(context: BrowserContext, reportUrl: string): Prom
 
   try {
     console.log(`\nNavigating to report: ${reportUrl}`);
-    await page.goto(reportUrl, { waitUntil: "networkidle", timeout: 30000 });
+    await page.goto(reportUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // Wait for report content to render (wmde-markdown containers)
+    await page.waitForSelector(".wmde-markdown", { timeout: 30000 }).catch(() => {
+      console.log("wmde-markdown not found, waiting extra...");
+    });
     await page.waitForTimeout(3000);
 
     await page.screenshot({ path: path.join(SCREENSHOT_DIR, "report-detail.png"), fullPage: true });
@@ -194,14 +218,36 @@ async function getReportDetail(context: BrowserContext, reportUrl: string): Prom
       const md: string[] = [];
 
       // --- 1. Title ---
+      // New UI: H1 is "Bug Bounty Report #ID", real title is a separate element
       const h1 = document.querySelector("h1");
-      if (h1) md.push(`# ${(h1 as HTMLElement).innerText.trim()}`, "");
+      const h1Text = (h1 as HTMLElement)?.innerText?.trim() || "";
+
+      // The actual report title is typically after the h1, in a larger heading/text
+      // Look for the title text that's NOT the h1
+      let reportTitle = "";
+      const allHeadings = document.querySelectorAll("h1, h2, h3, [class*='title']");
+      for (const heading of allHeadings) {
+        const text = (heading as HTMLElement).innerText?.trim() || "";
+        if (text && !text.startsWith("Bug Bounty Report") && text !== "Details" &&
+            text !== "Description" && text !== "Timeline" && text.length > 20) {
+          reportTitle = text;
+          break;
+        }
+      }
+
+      if (reportTitle) {
+        md.push(`# ${reportTitle}`, "");
+      } else if (h1Text) {
+        md.push(`# ${h1Text}`, "");
+      }
 
       // --- 2. Subtitle (submitted by...) ---
-      const h1Next = h1?.nextElementSibling as HTMLElement | null;
-      if (h1Next) {
-        const sub = h1Next.innerText?.trim() || "";
-        if (sub.includes("Submitted")) md.push(`> ${sub}`, "");
+      for (const el of document.querySelectorAll("*")) {
+        const text = (el as HTMLElement).innerText?.trim() || "";
+        if (text.startsWith("Submitted") && text.includes("by @") && el.children.length < 5) {
+          md.push(`> ${text}`, "");
+          break;
+        }
       }
 
       // --- 3. Metadata key-value pairs ---
@@ -272,37 +318,23 @@ async function getReportDetail(context: BrowserContext, reportUrl: string): Prom
       }
 
       // --- 5. Walk DOM nodes and convert to markdown ---
-      // Start from "Details" h2 to skip metadata already extracted above
-      const nodes = container.querySelectorAll("h2, h3, p, pre, ul, ol, blockquote");
+      const nodes = container.querySelectorAll("h2, h3, p, pre, ul, ol, blockquote, table");
       let started = false;
 
       for (const el of nodes) {
         const tag = el.tagName;
         const text = (el as HTMLElement).innerText?.trim() || "";
 
-        // Start capturing from the "Details" heading
-        if (tag === "H2" && text === "Details") {
-          started = true;
-        }
+        if (tag === "H2" && text === "Details") started = true;
         if (!started) continue;
 
-        // Stop at Timeline section
         if (tag === "H2" && text === "Timeline") break;
-        // Stop at Attachments section
         if (tag === "H2" && text === "Attachments") break;
 
-        if (tag === "H2") {
-          md.push(`\n## ${text}\n`);
-          continue;
-        }
-
-        if (tag === "H3") {
-          md.push(`\n### ${text}\n`);
-          continue;
-        }
+        if (tag === "H2") { md.push(`\n## ${text}\n`); continue; }
+        if (tag === "H3") { md.push(`\n### ${text}\n`); continue; }
 
         if (tag === "P") {
-          // Skip <p> inside <li> (already handled by UL/OL)
           if (el.closest("li")) continue;
           if (text) md.push(`${text}\n`);
           continue;
@@ -314,7 +346,6 @@ async function getReportDetail(context: BrowserContext, reportUrl: string): Prom
         }
 
         if (tag === "UL") {
-          // Skip nested lists (already handled by parent list's li.innerText)
           if (el.closest("li")) continue;
           el.querySelectorAll(":scope > li").forEach((li) => {
             md.push(`- ${(li as HTMLElement).innerText.trim()}`);
@@ -340,6 +371,31 @@ async function getReportDetail(context: BrowserContext, reportUrl: string): Prom
               .map((line: string) => `> ${line}`)
               .join("\n") + "\n"
           );
+          continue;
+        }
+
+        if (tag === "TABLE") {
+          // Convert HTML table to markdown table
+          const rows = el.querySelectorAll("tr");
+          const tableRows: string[][] = [];
+          for (const row of rows) {
+            const cells = row.querySelectorAll("th, td");
+            const rowData: string[] = [];
+            for (const cell of cells) {
+              rowData.push((cell as HTMLElement).innerText?.trim().replace(/\|/g, "\\|") || "");
+            }
+            tableRows.push(rowData);
+          }
+          if (tableRows.length > 0) {
+            // First row as header
+            md.push(`| ${tableRows[0].join(" | ")} |`);
+            md.push(`| ${tableRows[0].map(() => "---").join(" | ")} |`);
+            for (let r = 1; r < tableRows.length; r++) {
+              md.push(`| ${tableRows[r].join(" | ")} |`);
+            }
+            md.push("");
+          }
+          continue;
         }
       }
 
@@ -364,7 +420,7 @@ async function main() {
 
   const context = await chromium.launchPersistentContext(USER_DATA_DIR, {
     headless: true,
-    viewport: { width: 1280, height: 800 },
+    viewport: { width: 1280, height: 900 },
     args: ["--disable-blink-features=AutomationControlled", "--no-sandbox"],
   });
 
@@ -389,7 +445,7 @@ async function main() {
       reports.forEach((r, i) => {
         console.log(`[${i + 1}] ${r.id} ${r.title}`);
         console.log(`    Severity: ${r.severity} | Type: ${r.type} | Status: ${r.status}`);
-        console.log(`    Reporter: ${r.reporter} | Level: ${r.level}`);
+        console.log(`    Whitehat: ${r.whitehat} | SLA: ${r.sla}`);
         console.log(`    Date: ${r.date}`);
         console.log(`    Link: ${r.link}`);
         console.log("");
